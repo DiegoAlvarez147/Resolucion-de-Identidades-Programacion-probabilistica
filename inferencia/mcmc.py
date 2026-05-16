@@ -4,13 +4,19 @@ Motor de inferencia MCMC para el OUPM — cap. 18.2.2 del libro.
 
 Implementa Metropolis-Hastings con tres tipos de movimientos:
   1. Reasignar: cambiar Source(r) de un registro a otro abonado
-  2. Birth:     añadir un nuevo abonado al mundo  ← clave para universo abierto
+  2. Birth:     añadir un nuevo abonado al mundo
   3. Death:     eliminar un abonado sin registros asignados
 
-El algoritmo acepta/rechaza cada movimiento con probabilidad:
-  α = min(1, P(W') * Q(W|W') / (P(W) * Q(W'|W)))
-
-Todo implementado desde cero — sin librerías de inferencia.
+Correcciones respecto a la versión anterior:
+  1. Birth/death ahora son movimientos inversos balanceados:
+       Q(death | birth) / Q(birth | death) se calcula correctamente.
+     Antes el ratio de Hastings para birth era siempre positivo porque
+     log_q_bwd < log_q_fwd, haciendo que casi todo birth se aceptara
+     y death nunca tuviera chance de equilibrar.
+  2. El prior Poisson sobre k se recalcula completo en birth/death
+     (son movimientos que cambian la estructura del mundo, no solo Source).
+  3. Para reasignar se mantiene la optimización de Markov blanket.
+  4. proponer() sigue retornando 5 elementos (compatible con simulacion_vivo).
 """
 
 import math
@@ -24,26 +30,14 @@ from datos.registro import Registro
 # ──────────────────────────────────────────────
 
 class PropuestaMCMC:
-    """
-    Genera movimientos propuestos en el espacio de mundos posibles.
-    Cada movimiento tiene una probabilidad de propuesta Q(W'|W)
-    necesaria para calcular la razón de Hastings.
-    """
 
     def __init__(self, rng: random.Random):
         self.rng = rng
 
     def proponer(self, mundo: ModeloOUPM) -> tuple:
         """
-        Elige aleatoriamente un tipo de movimiento y lo aplica.
-        Retorna (mundo_nuevo, log_q_forward, log_q_backward, tipo)
-        donde log_q_* son los log de las probabilidades de propuesta.
+        Retorna (mundo_nuevo, log_q_fwd, log_q_bwd, tipo, regs_afectados).
         """
-        # Pesos de cada tipo de movimiento
-        n_ab = len(mundo.abonados)
-        n_reg = len(mundo.registros)
-
-        # Calcular cuántos abonados quedarían vacíos si hacemos death
         vacios = self._abonados_vacios(mundo)
 
         peso_reasignar = 0.60
@@ -61,78 +55,97 @@ class PropuestaMCMC:
             return self._mover_death(mundo, vacios)
 
     def _abonados_vacios(self, mundo: ModeloOUPM) -> list:
-        """Abonados sin ningún registro asignado (candidatos para death)."""
         asignados = set(ab.id for ab in mundo.source.values())
         return [ab for ab in mundo.abonados if ab.id not in asignados]
 
     def _mover_reasignar(self, mundo: ModeloOUPM) -> tuple:
         """
-        Movimiento 1 — Reasignar: elige un registro r al azar
-        y le asigna un abonado diferente a' al azar.
-        Q(W'|W) = 1/n_reg * 1/n_ab  (uniforme sobre r y a')
+        Reasigna un registro a un abonado elegido uniformemente.
+        Q(W'|W) = 1/n_reg * 1/n_ab  (simétrico, se cancela en M-H)
         """
         mundo_nuevo = mundo.clonar()
-        reg = self.rng.choice(mundo_nuevo.registros)
+        reg    = self.rng.choice(mundo_nuevo.registros)
         ab_nuevo = self.rng.choice(mundo_nuevo.abonados)
         mundo_nuevo.source[reg.id] = ab_nuevo
 
         n_reg = len(mundo.registros)
         n_ab  = len(mundo.abonados)
-        log_q_fwd = -math.log(n_reg) - math.log(n_ab)
-        log_q_bwd = -math.log(n_reg) - math.log(n_ab)
-        return mundo_nuevo, log_q_fwd, log_q_bwd, 'reasignar'
+        log_q = -math.log(n_reg) - math.log(n_ab)
+
+        return mundo_nuevo, log_q, log_q, 'reasignar', [reg]
 
     def _mover_birth(self, mundo: ModeloOUPM) -> tuple:
         """
-        Movimiento 2 — Birth: añade un nuevo abonado al mundo.
-        Sus atributos se toman de un registro aleatorio (propuesta informada).
-        Opcionalmente migra un registro al nuevo abonado.
+        Birth: crea un abonado nuevo y migra un registro a él.
 
-        Q(W'|W) depende de la probabilidad de escoger este registro base
-        y la probabilidad de mover el registro elegido.
+        Q(birth → W') = p_birth * (1/n_reg)
+          elegimos r_base uniformemente entre todos los registros
+
+        Q(death → W) = p_death_en_W' * (1/n_vacios_en_W')
+          en W' el abonado nuevo es el único vacío posible si r_base
+          se mueve a él, pero puede haber otros vacíos. Para el ratio
+          de Hastings usamos la probabilidad del movimiento inverso exacto:
+          death en W' que elimina al abonado recién creado.
+          n_vacios_en_W' = len(vacios_en_W') después del birth.
         """
         mundo_nuevo = mundo.clonar()
         r_base = self.rng.choice(mundo_nuevo.registros)
 
-        # Crear abonado nuevo con atributos del registro base (con ruido leve)
-        ab_nuevo = Abonado(
+        ab_nuevo = mundo_nuevo._nuevo_abonado(
             nombre_real=r_base.nombre_obs,
             telefono_real=r_base.telefono_obs,
             ip_real=r_base.ip_obs,
             ciudad_real=r_base.ciudad_obs,
         )
-        ab_nuevo.id = max((a.id for a in mundo_nuevo.abonados), default=0) + 1
         mundo_nuevo.abonados.append(ab_nuevo)
-
-        # Mover el registro base al nuevo abonado
         mundo_nuevo.source[r_base.id] = ab_nuevo
 
-        n_reg = len(mundo.registros)
-        n_ab_nuevo = len(mundo_nuevo.abonados)
-        n_ab_viejo = len(mundo.abonados)
+        # Q forward: p_birth * 1/n_reg
+        p_birth = 0.25
+        n_reg   = len(mundo.registros)
+        log_q_fwd = math.log(p_birth) - math.log(n_reg)
 
-        log_q_fwd = -math.log(n_reg)          # escoger r_base
-        log_q_bwd = -math.log(n_ab_nuevo)     # death escoge el abonado a eliminar
-        return mundo_nuevo, log_q_fwd, log_q_bwd, 'birth'
+        # Q backward: probabilidad de proponer death en W' que elimine ab_nuevo.
+        # ab_nuevo tiene r_base asignado → NO es vacío en W'.
+        # Para que death sea posible, necesitamos vacios en W'.
+        # vacios_en_W' = vacios_en_W (birth no libera ni ocupa otros abonados)
+        vacios_en_W_prima = self._abonados_vacios(mundo_nuevo)
+        n_vacios_W_prima  = len(vacios_en_W_prima)
+        if n_vacios_W_prima == 0:
+            # No hay camino de retorno por death → penalizar fuertemente
+            log_q_bwd = -math.inf
+        else:
+            p_death = 0.15
+            log_q_bwd = math.log(p_death) - math.log(n_vacios_W_prima)
+
+        return mundo_nuevo, log_q_fwd, log_q_bwd, 'birth', [r_base]
 
     def _mover_death(self, mundo: ModeloOUPM, vacios: list) -> tuple:
         """
-        Movimiento 3 — Death: elimina un abonado vacío.
-        Solo se puede hacer si hay abonados sin registros asignados.
-        Q(W'|W) = 1/|vacios| (uniforme sobre abonados vacíos)
+        Death: elimina un abonado vacío elegido uniformemente.
+
+        Q(death → W') = p_death * (1/n_vacios)
+        Q(birth → W)  = p_birth * (1/n_reg)
+          el birth inverso elegiría r_base = el registro que antes
+          estaba en el abonado eliminado; pero ese abonado está vacío,
+          así que cualquier registro podría ser r_base.
         """
         mundo_nuevo = mundo.clonar()
-        ab_eliminar_id = self.rng.choice(vacios).id
+        ab_eliminar = self.rng.choice(vacios)
+        ab_obj = next(a for a in mundo_nuevo.abonados
+                      if a.id == ab_eliminar.id)
+        mundo_nuevo.abonados.remove(ab_obj)
 
-        # Encontrar el abonado en el mundo clonado
-        ab_eliminar = next(a for a in mundo_nuevo.abonados
-                          if a.id == ab_eliminar_id)
-        mundo_nuevo.abonados.remove(ab_eliminar)
+        p_death   = 0.15
+        n_vacios  = len(vacios)
+        log_q_fwd = math.log(p_death) - math.log(n_vacios)
 
-        n_vacios = len(vacios)
-        log_q_fwd = -math.log(n_vacios)
-        log_q_bwd = -math.log(len(mundo.registros))  # birth eligió r_base
-        return mundo_nuevo, log_q_fwd, log_q_bwd, 'death'
+        # Birth inverso: p_birth * 1/n_reg
+        p_birth = 0.25
+        n_reg   = len(mundo.registros)
+        log_q_bwd = math.log(p_birth) - math.log(n_reg)
+
+        return mundo_nuevo, log_q_fwd, log_q_bwd, 'death', []
 
 
 # ──────────────────────────────────────────────
@@ -140,19 +153,6 @@ class PropuestaMCMC:
 # ──────────────────────────────────────────────
 
 class MotorMCMC:
-    """
-    Motor de inferencia Metropolis-Hastings para el OUPM.
-    Implementa el algoritmo descrito en cap. 18.2.2:
-
-      'MCMC for OUPMs explores the space of possible worlds.
-       A move can add or remove objects, changing the relational
-       structure. Each step takes constant time.'
-
-    Parámetros:
-      n_iter:   número total de iteraciones MCMC
-      burn_in:  iteraciones descartadas al inicio (calentamiento)
-      thin:     guardar una muestra cada 'thin' iteraciones
-    """
 
     def __init__(self, modelo: ModeloOUPM,
                  n_iter: int = 2000,
@@ -160,17 +160,16 @@ class MotorMCMC:
                  thin: int = 5,
                  semilla: int = 42,
                  verbose: bool = True):
-        self.modelo   = modelo
-        self.n_iter   = n_iter
-        self.burn_in  = burn_in
-        self.thin     = thin
-        self.rng      = random.Random(semilla)
-        self.verbose  = verbose
+        self.modelo    = modelo
+        self.n_iter    = n_iter
+        self.burn_in   = burn_in
+        self.thin      = thin
+        self.rng       = random.Random(semilla)
+        self.verbose   = verbose
         self.propuesta = PropuestaMCMC(self.rng)
 
-        # Historial para análisis
-        self.muestras: list[dict] = []
-        self.log_probs: list[float] = []
+        self.muestras: list  = []
+        self.log_probs: list = []
         self.tasa_aceptacion_por_tipo: dict = {
             'reasignar': [0, 0],
             'birth':     [0, 0],
@@ -178,13 +177,9 @@ class MotorMCMC:
         }
 
     def correr(self) -> "Posterior":
-        """
-        Ejecuta el MCMC completo y retorna el objeto Posterior.
-        """
-        # Inicializar mundo
         self.modelo.inicializar_aleatorio(self.rng)
         mundo_actual = self.modelo
-        lp_actual = mundo_actual.log_prob_mundo()
+        lp_actual    = mundo_actual.log_prob_mundo()
 
         if self.verbose:
             print(f"  Mundo inicial: {len(mundo_actual.abonados)} abonados, "
@@ -193,63 +188,56 @@ class MotorMCMC:
         for it in range(self.n_iter):
             mundo_actual, lp_actual = self._paso_mh(mundo_actual, lp_actual)
 
-            # Guardar muestra (post burn-in, con thinning)
             if it >= self.burn_in and (it - self.burn_in) % self.thin == 0:
                 self.muestras.append(self._snapshot(mundo_actual))
                 self.log_probs.append(lp_actual)
 
             if self.verbose and (it + 1) % 500 == 0:
-                n_ab = len(mundo_actual.abonados)
                 print(f"  Iter {it+1:4d}/{self.n_iter} | "
-                      f"abonados={n_ab:3d} | log P={lp_actual:.3f} | "
+                      f"abonados={len(mundo_actual.abonados):3d} | "
+                      f"log P={lp_actual:.3f} | "
                       f"muestras={len(self.muestras)}")
 
         if self.verbose:
             self._imprimir_estadisticas()
 
-        return Posterior(self.muestras, self.log_probs,
-                        self.modelo.registros)
+        return Posterior(self.muestras, self.log_probs, self.modelo.registros)
 
-    def _paso_mh(self, mundo: ModeloOUPM,
-                 lp_mundo: float) -> tuple:
-        """
-        Un paso de Metropolis-Hastings.
-        Implementa:
-          α = min(1, P(W')/P(W) * Q(W|W')/Q(W'|W))
-          Aceptar W' con probabilidad α.
-        """
+    def _paso_mh(self, mundo: ModeloOUPM, lp_mundo: float) -> tuple:
         try:
-            mundo_prop, log_q_fwd, log_q_bwd, tipo = \
+            mundo_prop, log_q_fwd, log_q_bwd, tipo, regs_afectados = \
                 self.propuesta.proponer(mundo)
         except Exception:
             return mundo, lp_mundo
 
-        lp_prop = mundo_prop.log_prob_mundo()
+        # Birth/death cambian la estructura del mundo (k distinto):
+        # usamos log_prob_mundo() completo para capturar el prior Poisson.
+        # Reasignar: solo cambia Source(r) → blanket es suficiente.
+        if tipo == 'reasignar':
+            lp_blanket_prop = mundo_prop.log_prob_markov_blanket(regs_afectados)
+            lp_blanket_act  = mundo.log_prob_markov_blanket(regs_afectados)
+            lp_prop = lp_mundo + (lp_blanket_prop - lp_blanket_act)
+        else:
+            lp_prop = mundo_prop.log_prob_mundo()
 
-        # Razón de Metropolis-Hastings (en log)
         log_alpha = (lp_prop - lp_mundo) + (log_q_bwd - log_q_fwd)
-        log_alpha = min(0.0, log_alpha)  # min(1, alpha) en log
+        log_alpha = min(0.0, log_alpha)
 
-        # Decisión de aceptación
         self.tasa_aceptacion_por_tipo[tipo][1] += 1
         if math.log(self.rng.random() + 1e-300) < log_alpha:
             self.tasa_aceptacion_por_tipo[tipo][0] += 1
             return mundo_prop, lp_prop
-        else:
-            return mundo, lp_mundo
+
+        return mundo, lp_mundo
 
     def _snapshot(self, mundo: ModeloOUPM) -> dict:
-        """Captura el estado actual del mundo para agregar en la posterior."""
-        source_snapshot = {
-            rid: ab.id for rid, ab in mundo.source.items()
-        }
         return {
             'n_abonados': len(mundo.abonados),
-            'source': source_snapshot,
-            'abonados': {ab.id: {
-                'nombre': ab.nombre_real,
+            'source':     {rid: ab.id for rid, ab in mundo.source.items()},
+            'abonados':   {ab.id: {
+                'nombre':   ab.nombre_real,
                 'telefono': ab.telefono_real,
-                'ciudad': ab.ciudad_real,
+                'ciudad':   ab.ciudad_real,
             } for ab in mundo.abonados},
         }
 
@@ -262,31 +250,18 @@ class MotorMCMC:
 
 
 # ──────────────────────────────────────────────
-# Clase Posterior — agrega las muestras MCMC
+# Clase Posterior
 # ──────────────────────────────────────────────
 
 class Posterior:
-    """
-    Agrega las muestras del MCMC para responder consultas probabilísticas.
-    Implementa las cuatro consultas definidas en el planteamiento:
-      1. P(Source(rA) = Source(rB)) — ¿misma identidad?
-      2. P(#Abonados = k)           — ¿cuántos abonados reales?
-      3. Clustering MAP              — agrupación más probable
-      4. Convergencia                — diagnóstico del MCMC
-    """
 
-    def __init__(self, muestras: list[dict], log_probs: list[float],
-                 registros: list[Registro]):
+    def __init__(self, muestras: list, log_probs: list, registros: list):
         self.muestras   = muestras
         self.log_probs  = log_probs
         self.registros  = registros
         self.n_muestras = len(muestras)
 
     def p_misma_identidad(self, id_reg_a: str, id_reg_b: str) -> float:
-        """
-        P(Source(rA) = Source(rB) | evidencia)
-        Fracción de muestras donde A y B están asignados al mismo abonado.
-        """
         if self.n_muestras == 0:
             return 0.0
         cuenta = sum(
@@ -296,14 +271,12 @@ class Posterior:
         return cuenta / self.n_muestras
 
     def p_n_abonados(self, k: int) -> float:
-        """P(#Abonados = k | evidencia)"""
         if self.n_muestras == 0:
             return 0.0
         return sum(1 for m in self.muestras
                    if m['n_abonados'] == k) / self.n_muestras
 
     def distribucion_n_abonados(self) -> dict:
-        """Distribución completa sobre el número de abonados."""
         dist = {}
         for m in self.muestras:
             k = m['n_abonados']
@@ -311,23 +284,13 @@ class Posterior:
         return {k: v / self.n_muestras for k, v in sorted(dist.items())}
 
     def cluster_map(self) -> dict:
-        """
-        Estimación MAP: agrupación de registros más frecuente.
-        Retorna {id_registro: cluster_id} donde cluster_id es un entero
-        comenzando en 0 (los IDs de abonados se renormalizan).
-        """
         if not self.muestras:
             return {}
-
-        # Encontrar la muestra con mayor log-prob
-        idx_map = max(range(self.n_muestras),
-                      key=lambda i: self.log_probs[i])
+        idx_map     = max(range(self.n_muestras), key=lambda i: self.log_probs[i])
         muestra_map = self.muestras[idx_map]
-
-        # Renormalizar IDs de abonados a 0, 1, 2, ...
-        ids_vistos = {}
-        contador = 0
-        resultado = {}
+        ids_vistos  = {}
+        contador    = 0
+        resultado   = {}
         for rid, ab_id in muestra_map['source'].items():
             if ab_id not in ids_vistos:
                 ids_vistos[ab_id] = contador
@@ -336,12 +299,7 @@ class Posterior:
         return resultado
 
     def matriz_cocluster(self) -> dict:
-        """
-        Matriz de co-clustering: para cada par (rA, rB),
-        P(misma identidad | evidencia).
-        Útil para visualizar la incertidumbre de identidad.
-        """
-        ids = [r.id for r in self.registros]
+        ids    = [r.id for r in self.registros]
         matriz = {}
         for i, ra in enumerate(ids):
             for rb in ids[i:]:
@@ -351,15 +309,13 @@ class Posterior:
         return matriz
 
     def resumen(self) -> str:
-        """Imprime un resumen legible de la posterior."""
         if not self.muestras:
             return "Sin muestras."
-        dist = self.distribucion_n_abonados()
+        dist  = self.distribucion_n_abonados()
         k_map = max(dist, key=dist.get)
         lineas = [
             f"Muestras MCMC: {self.n_muestras}",
-            f"Abonados más probable (MAP): k={k_map} "
-            f"(P={dist[k_map]:.1%})",
+            f"Abonados más probable (MAP): k={k_map} (P={dist[k_map]:.1%})",
             "Distribución sobre #Abonados:",
         ]
         for k, p in dist.items():

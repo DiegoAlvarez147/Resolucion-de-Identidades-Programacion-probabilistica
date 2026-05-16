@@ -26,7 +26,6 @@ def _log_poisson(k: int, lam: float) -> float:
     """log P(X=k) para X ~ Poisson(lambda). Implementada desde cero."""
     if k < 0 or lam <= 0:
         return -math.inf
-    # log(lambda^k * e^-lambda / k!) = k*log(lambda) - lambda - log(k!)
     log_fact_k = sum(math.log(i) for i in range(1, k + 1)) if k > 0 else 0.0
     return k * math.log(lam) - lam - log_fact_k
 
@@ -38,25 +37,19 @@ def _log_prob_obs_dado_source(registro: Registro,
     Implementa:  Text(r) ~ NoisyString(Nombre(Source(r)))  [cap. 18.2]
 
     Usa similitudes como proxy de probabilidad:
-      P(obs | true) = f(similitud(obs, true))
-    donde f mapea [0,1] → probabilidad con suavizado.
+      P(obs | true) = epsilon + (1-epsilon) * similitud(obs, true)
     """
     sim_nombre   = similitud_cadena(registro.nombre_obs, abonado.nombre_real)
     sim_telefono = similitud_telefono(registro.telefono_obs, abonado.telefono_real)
     sim_ip       = misma_subred(registro.ip_obs, abonado.ip_real)
     sim_ciudad   = similitud_cadena(registro.ciudad_obs, abonado.ciudad_real)
 
-    # CPT: probabilidad de observar este atributo dado el valor real
-    # Usamos modelo exponencial: P = epsilon + (1-epsilon) * similitud
-    # epsilon = ruido de fondo (siempre hay chance de observar cualquier cosa)
     epsilon = 0.05
-
     p_nombre   = epsilon + (1 - epsilon) * sim_nombre
     p_telefono = epsilon + (1 - epsilon) * sim_telefono
     p_ip       = epsilon + (1 - epsilon) * sim_ip
     p_ciudad   = epsilon + (1 - epsilon) * sim_ciudad
 
-    # Log-prob total (independencia condicional dado Source)
     return (0.40 * math.log(p_nombre) +
             0.30 * math.log(p_telefono) +
             0.20 * math.log(p_ip) +
@@ -79,16 +72,18 @@ class Abonado:
     Un abonado real hipotético en el mundo actual.
     En el OUPM, cada abonado es un objeto generado por:
       #Abonado ~ Poisson(lambda)   [number statement, cap. 18.2]
-    Sus atributos son las variables latentes del modelo.
-    """
 
-    _contador = 0
+    NOTA: el ID ya no viene de un contador de clase (_contador eliminado).
+    Ahora lo asigna ModeloOUPM via _siguiente_id, evitando el bug de
+    IDs desfasados al clonar mundos múltiples veces.
+    """
 
     def __init__(self, nombre_real: str, telefono_real: str,
                  ip_real: str, ciudad_real: str,
-                 es_fraudulento: bool = False):
-        Abonado._contador += 1
-        self.id = Abonado._contador
+                 es_fraudulento: bool = False,
+                 id_forzado: int = None):
+        # id_forzado permite que clonar() preserve el mismo ID
+        self.id            = id_forzado if id_forzado is not None else -1
         self.nombre_real   = nombre_real
         self.telefono_real = telefono_real
         self.ip_real       = ip_real
@@ -123,13 +118,27 @@ class ModeloOUPM:
     cambiando Source(r) y añadiendo/eliminando abonados.
     """
 
-    LAMBDA_PRIOR = 5.0   # prior Poisson sobre número de abonados
+    LAMBDA_PRIOR = 5.0
 
-    def __init__(self, registros: list[Registro]):
-        self.registros = registros
-        self.abonados: list[Abonado] = []
-        # Source(r): mapea id_registro → Abonado
-        self.source: dict[str, Abonado] = {}
+    def __init__(self, registros: list):
+        self.registros   = registros
+        self.abonados: list = []
+        self.source: dict  = {}
+        # Contador local de IDs — reemplaza Abonado._contador (bug fix)
+        self._siguiente_id = 1
+
+    def _nuevo_abonado(self, nombre_real, telefono_real,
+                       ip_real, ciudad_real,
+                       es_fraudulento=False) -> Abonado:
+        """Crea un Abonado con ID único dentro de este mundo."""
+        ab = Abonado(nombre_real=nombre_real,
+                     telefono_real=telefono_real,
+                     ip_real=ip_real,
+                     ciudad_real=ciudad_real,
+                     es_fraudulento=es_fraudulento,
+                     id_forzado=self._siguiente_id)
+        self._siguiente_id += 1
+        return ab
 
     # ── Inicialización ──────────────────────────────
 
@@ -139,25 +148,22 @@ class ModeloOUPM:
         Crea un mundo inicial aleatorio.
         Número de abonados ~ Poisson(lambda), luego asigna Source al azar.
         """
-        Abonado._contador = 0
+        self._siguiente_id = 1   # reiniciar contador local
         if n_abonados_inicial is None:
-            # Samplear de Poisson truncado en [1, 2*|R|]
             n_abonados_inicial = max(1, int(rng.gauss(
                 self.LAMBDA_PRIOR, math.sqrt(self.LAMBDA_PRIOR))))
             n_abonados_inicial = min(n_abonados_inicial, 2 * len(self.registros))
 
-        # Crear abonados con atributos tomados de registros aleatorios
         self.abonados = []
         for _ in range(n_abonados_inicial):
             r_ref = rng.choice(self.registros)
-            self.abonados.append(Abonado(
+            self.abonados.append(self._nuevo_abonado(
                 nombre_real=r_ref.nombre_obs,
                 telefono_real=r_ref.telefono_obs,
                 ip_real=r_ref.ip_obs,
                 ciudad_real=r_ref.ciudad_obs,
             ))
 
-        # Asignar Source(r) uniformemente
         for reg in self.registros:
             self.source[reg.id] = rng.choice(self.abonados)
 
@@ -165,24 +171,16 @@ class ModeloOUPM:
 
     def log_prob_mundo(self) -> float:
         """
-        Calcula log P(W) — probabilidad logarítmica del mundo actual.
-        Implementa la fórmula del cap. 18.2:
-
-          log P(W) = log P(k abonados)
-                   + sum_r [log P(Source(r)) + log P(obs(r)|Source(r))]
-
-        Solo calcula el Markov blanket necesario para M-H (cap. 18.2.2).
+        Calcula log P(W) completo — usado solo para inicialización
+        y para snapshots de diagnóstico.
+        En el motor MCMC se usa log_prob_markov_blanket() para eficiencia.
         """
         k = len(self.abonados)
         if k == 0:
             return -math.inf
 
-        # Término 1: prior sobre número de abonados
         lp = _log_poisson(k, self.LAMBDA_PRIOR)
-
-        # Término 2: por cada registro, P(Source) * P(obs|Source)
-        n = k  # denominador del prior uniforme de Source
-        log_p_source = _log_prob_uniforme_source(n)
+        log_p_source = _log_prob_uniforme_source(k)
 
         for reg in self.registros:
             ab = self.source.get(reg.id)
@@ -193,13 +191,18 @@ class ModeloOUPM:
 
         return lp
 
-    def log_prob_markov_blanket(self, registros_afectados: list[Registro],
-                                 abonados_afectados: list[Abonado]) -> float:
+    def log_prob_markov_blanket(self, registros_afectados: list) -> float:
         """
-        Calcula solo la parte de log P(W) que cambia tras un movimiento.
-        Optimización clave para MCMC: en vez de recalcular todo el mundo,
-        solo recalcula el Markov blanket de las variables modificadas.
-        (cap. 18.2.2 — 'probability computations take constant time')
+        Calcula la parte de log P(W) que cambia tras un movimiento.
+
+        En cada paso M-H solo uno o pocos registros cambian de abonado,
+        por lo que recalcular log P(W) completo es innecesario.
+        Este método computa únicamente:
+
+          log P(k) + sum_{r in afectados} [log P(Source(r)) + log P(obs(r)|Source(r))]
+
+        Complejidad: O(|registros_afectados|) en vez de O(|R|).
+        Conectado al motor en PropuestaMCMC._calcular_lp_propuesta().
         """
         k = len(self.abonados)
         if k == 0:
@@ -237,9 +240,12 @@ class ModeloOUPM:
         return red
 
     def clonar(self) -> "ModeloOUPM":
-        """Crea una copia profunda del mundo actual para el paso M-H."""
+        """
+        Crea una copia profunda del mundo actual para el paso M-H.
+        Preserva _siguiente_id para que IDs de abonados nuevos no colisionen.
+        """
         nuevo = ModeloOUPM(self.registros)
-        # Copiar abonados
+        nuevo._siguiente_id = self._siguiente_id   # hereda el contador
         mapa_ids = {}
         for ab in self.abonados:
             ab_nuevo = Abonado(
@@ -248,11 +254,10 @@ class ModeloOUPM:
                 ip_real=ab.ip_real,
                 ciudad_real=ab.ciudad_real,
                 es_fraudulento=ab.es_fraudulento,
+                id_forzado=ab.id,
             )
-            ab_nuevo.id = ab.id
             mapa_ids[ab.id] = ab_nuevo
             nuevo.abonados.append(ab_nuevo)
-        # Copiar source manteniendo referencias a los nuevos abonados
         for rid, ab in self.source.items():
             nuevo.source[rid] = mapa_ids[ab.id]
         return nuevo

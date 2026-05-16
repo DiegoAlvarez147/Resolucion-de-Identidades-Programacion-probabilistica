@@ -457,18 +457,25 @@ class SimuladorPasoAPaso:
     def paso(self):
         self.iteracion += 1
         try:
-            prop, lq_fwd, lq_bwd, tipo = self.propuesta.proponer(self.mundo)
+            prop, lq_fwd, lq_bwd, tipo, regs_afectados = self.propuesta.proponer(self.mundo)
         except Exception:
             return self._snap(), None
 
-        lp_prop   = prop.log_prob_mundo()
+        # Mismo cálculo que MotorMCMC._paso_mh
+        if tipo == 'reasignar' and regs_afectados:
+            lp_blanket_prop = prop.log_prob_markov_blanket(regs_afectados)
+            lp_blanket_act  = self.mundo.log_prob_markov_blanket(regs_afectados)
+            lp_prop = self.lp + (lp_blanket_prop - lp_blanket_act)
+        else:
+            lp_prop = prop.log_prob_mundo()
+
         log_alpha = min(0.0, (lp_prop - self.lp) + (lq_bwd - lq_fwd))
         self.tasas[tipo][1] += 1
         self.ultimo_mov = tipo
 
         reg_afectado = None
-        if tipo == 'reasignar' and self.registros:
-            reg_afectado = self.rng.choice(self.registros).id
+        if tipo == 'reasignar' and regs_afectados:
+            reg_afectado = regs_afectados[0].id
 
         if math.log(self.rng.random() + 1e-300) < log_alpha:
             self.mundo = prop

@@ -12,40 +12,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from datos.registro import GeneradorSintetico
 from modelo.oupm import ModeloOUPM
 from inferencia.mcmc import MotorMCMC
-
-
-def evaluar_resultado(posterior, ground_truth: dict,
-                      registros: list) -> dict:
-    """
-    Compara el resultado del sistema con el ground truth.
-    Calcula:
-      - Precisión de pares: % de pares (rA,rB) con identidad correcta
-      - Error en k: |k_estimado - k_real|
-    """
-    ids = [r.id for r in registros]
-    pares_correctos = 0
-    pares_total = 0
-    for i, ra in enumerate(ids):
-        for rb in ids[i+1:]:
-            pares_total += 1
-            mismos_real = (ground_truth[ra] == ground_truth[rb])
-            p_mismos    = posterior.p_misma_identidad(ra, rb)
-            predicho    = p_mismos >= 0.5
-            if predicho == mismos_real:
-                pares_correctos += 1
-
-    precision = pares_correctos / pares_total if pares_total > 0 else 0
-
-    dist = posterior.distribucion_n_abonados()
-    k_estimado = max(dist, key=dist.get)
-    k_real = len(set(ground_truth.values()))
-
-    return {
-        'precision_pares': precision,
-        'k_estimado': k_estimado,
-        'k_real': k_real,
-        'error_k': abs(k_estimado - k_real),
-    }
+from analisis.evaluacion import evaluar_resultado, imprimir_metricas
 
 
 def correr_escenario(nombre: str, tipo: str,
@@ -73,11 +40,7 @@ def correr_escenario(nombre: str, tipo: str,
     print(f"\n  {posterior.resumen()}")
 
     metricas = evaluar_resultado(posterior, ground_truth, registros)
-    print(f"\n  Métricas de evaluación:")
-    print(f"    Precisión de pares  : {metricas['precision_pares']:.1%}")
-    print(f"    k real              : {metricas['k_real']}")
-    print(f"    k estimado (MAP)    : {metricas['k_estimado']}")
-    print(f"    Error en k          : {metricas['error_k']}")
+    imprimir_metricas(metricas)
 
     print(f"\n  Ejemplos de consultas de identidad:")
     ids = [r.id for r in registros[:6]]
@@ -87,7 +50,8 @@ def correr_escenario(nombre: str, tipo: str,
             p = posterior.p_misma_identidad(ra, rb)
             mismos = ground_truth[ra] == ground_truth[rb]
             marca = "OK" if (p >= 0.5) == mismos else "FALLO"
-            print(f"    P({ra}={rb}) = {p:.2f}  [real: {'mismos' if mismos else 'distintos'}] {marca}")
+            print(f"    P({ra}={rb}) = {p:.2f}  "
+                  f"[real: {'mismos' if mismos else 'distintos'}] {marca}")
 
     return posterior, metricas, t1 - t0
 
@@ -96,22 +60,22 @@ if __name__ == "__main__":
     print("\nSistema Probabilístico de Resolución de Identidades")
     print("Programación Probabilística — Cap. 18 AIMA 4ed.\n")
 
-    resultados = {}
-
-    p_a, m_a, t_a = correr_escenario("A — Bajo ruido",   'A',
+    p_a, m_a, t_a = correr_escenario("A — Bajo ruido",    'A',
                                       n_iter=2000, burn_in=400)
-    p_b, m_b, t_b = correr_escenario("B — Alto ruido",   'B',
+    p_b, m_b, t_b = correr_escenario("B — Alto ruido",    'B',
                                       n_iter=3000, burn_in=600)
-    p_c, m_c, t_c = correr_escenario("C — Escalabilidad",'C',
+    p_c, m_c, t_c = correr_escenario("C — Escalabilidad", 'C',
                                       n_iter=4000, burn_in=800)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print("  RESUMEN COMPARATIVO")
-    print(f"{'='*60}")
-    print(f"  {'Escenario':<20} {'Precisión':>10} {'Error k':>8} {'Tiempo':>8}")
-    print(f"  {'-'*50}")
-    for nombre, m, t in [("A - bajo ruido", m_a, t_a),
-                          ("B - alto ruido", m_b, t_b),
-                          ("C - escala",     m_c, t_c)]:
-        print(f"  {nombre:<20} {m['precision_pares']:>9.1%} "
+    print(f"{'='*70}")
+    print(f"  {'Escenario':<22} {'Precisión':>10} {'F1':>7} "
+          f"{'Error k':>8} {'Tiempo':>8}")
+    print(f"  {'-'*58}")
+    for nombre, m, t in [("A - bajo ruido",  m_a, t_a),
+                          ("B - alto ruido",  m_b, t_b),
+                          ("C - escala",      m_c, t_c)]:
+        print(f"  {nombre:<22} {m['precision_pares']:>9.1%} "
+              f"{m['f1_pares']:>6.1%} "
               f"{m['error_k']:>8d} {t:>7.1f}s")

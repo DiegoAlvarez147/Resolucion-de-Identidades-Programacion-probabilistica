@@ -8,6 +8,8 @@ Cada registro fue generado por un abonado real, pero no sabemos cuál.
 import random
 import math
 
+# Pueden sobreescribirse al construir un Registro con pesos=(...).
+PESOS_DEFAULT = (0.40, 0.30, 0.20, 0.10)   # nombre, teléfono, ip, ciudad
 
 # ──────────────────────────────────────────────
 # Utilidades de similitud (implementadas desde cero)
@@ -86,20 +88,53 @@ class Registro:
     Un registro observable en la red del operador.
     Corresponde a una "observación" en el modelo OUPM:
       Text(r) ~ NoisyString(Nombre(Source(r)))   [cap. 18.2]
+
+    Parámetros
+    ----------
+    id_reg    : identificador único, e.g. 'R001'
+    nombre    : nombre observado (puede tener ruido tipográfico)
+    telefono  : teléfono observado (dígitos, puede tener errores)
+    ip        : dirección IP observada (formato 'a.b.c.d')
+    ciudad    : ciudad observada (puede ser abreviatura)
+    pesos     : tupla (w_nombre, w_tel, w_ip, w_ciudad) con suma ≈ 1.
+                Si es None se usan PESOS_DEFAULT.
     """
 
     def __init__(self, id_reg: str, nombre: str, telefono: str,
-                 ip: str, ciudad: str):
-        self.id = id_reg
-        self.nombre_obs = nombre
-        self.telefono_obs = telefono
-        self.ip_obs = ip
-        self.ciudad_obs = ciudad
+                 ip: str, ciudad: str,
+                 pesos: tuple = None):
+        # ── Validación de campos ──────────────────────────────────────────
+        if not isinstance(id_reg, str) or not id_reg.strip():
+            raise ValueError(f"id_reg debe ser un string no vacío, recibido: {id_reg!r}")
+        if not isinstance(nombre, str) or not nombre.strip():
+            raise ValueError(f"nombre vacío en registro {id_reg!r}")
+        if not isinstance(telefono, str) or not telefono.strip():
+            raise ValueError(f"telefono vacío en registro {id_reg!r}")
+        if not isinstance(ip, str) or len(ip.split('.')) != 4:
+            raise ValueError(f"ip con formato inválido en registro {id_reg!r}: {ip!r}")
+        if not isinstance(ciudad, str) or not ciudad.strip():
+            raise ValueError(f"ciudad vacía en registro {id_reg!r}")
+
+        self.id           = id_reg
+        self.nombre_obs   = nombre.strip()
+        self.telefono_obs = telefono.strip()
+        self.ip_obs       = ip.strip()
+        self.ciudad_obs   = ciudad.strip()
+
+        # ── Pesos configurables ───────────────────────────────────────────
+        if pesos is not None:
+            if len(pesos) != 4:
+                raise ValueError("pesos debe tener exactamente 4 elementos")
+            if abs(sum(pesos) - 1.0) > 0.01:
+                raise ValueError(f"Los pesos deben sumar 1.0, suma actual: {sum(pesos)}")
+            self._pesos = tuple(pesos)
+        else:
+            self._pesos = PESOS_DEFAULT
 
     def similitud(self, otro: "Registro") -> float:
         """
-        Similitud agregada entre dos registros.
-        Combina nombre, teléfono, IP y ciudad con pesos.
+        Similitud agregada entre dos registros usando pesos configurables.
+        Combina nombre, teléfono, IP y ciudad.
         Usada por el modelo para calcular P(obs | Source).
         """
         sim_nombre   = similitud_cadena(self.nombre_obs, otro.nombre_obs)
@@ -107,11 +142,11 @@ class Registro:
         sim_ip       = misma_subred(self.ip_obs, otro.ip_obs)
         sim_ciudad   = similitud_cadena(self.ciudad_obs, otro.ciudad_obs)
 
-        # Pesos: nombre y teléfono pesan más
-        return (0.40 * sim_nombre +
-                0.30 * sim_telefono +
-                0.20 * sim_ip +
-                0.10 * sim_ciudad)
+        w_n, w_t, w_i, w_c = self._pesos
+        return (w_n * sim_nombre +
+                w_t * sim_telefono +
+                w_i * sim_ip +
+                w_c * sim_ciudad)
 
     def __repr__(self):
         return (f"Registro({self.id!r}, nombre={self.nombre_obs!r}, "
@@ -149,15 +184,12 @@ def _ruido_nombre(nombre: str, nivel: float, rng: random.Random) -> str:
     if nivel == 0 or rng.random() > nivel:
         return nombre
     ops = []
-    # Abreviar nombre
     partes = nombre.split()
     if len(partes) >= 2 and rng.random() < 0.4:
         partes[0] = partes[0][0] + "."
         ops.append(' '.join(partes))
-    # Solo apellido
     if len(partes) >= 2 and rng.random() < 0.3:
         ops.append(partes[-1] + str(rng.randint(10, 99)))
-    # Tildes y minúsculas
     if rng.random() < 0.3:
         ops.append(nombre.lower().replace('é', 'e').replace('á', 'a'))
     return rng.choice(ops) if ops else nombre
@@ -169,7 +201,6 @@ def _ruido_telefono(tel: str, nivel: float, rng: random.Random) -> str:
         return tel
     digitos = list(''.join(c for c in tel if c.isdigit()))
     if rng.random() < nivel * 0.5 and digitos:
-        # Cambiar un dígito aleatorio
         pos = rng.randint(0, len(digitos) - 1)
         digitos[pos] = str((int(digitos[pos]) + rng.randint(1, 3)) % 10)
     return ''.join(digitos)
@@ -207,16 +238,27 @@ class GeneradorSintetico:
     def __init__(self, semilla: int = 42):
         self.rng = random.Random(semilla)
 
-    def generar_escenario(self, tipo: str) -> tuple:
+    def generar_escenario(self, tipo: str,
+                           n_abonados: int = None,
+                           registros_por_abonado: tuple = None,
+                           nivel_ruido: float = None,
+                           fraude_ratio: float = None) -> tuple:
         """
         Genera un escenario de prueba.
-        Retorna (registros, ground_truth) donde ground_truth
-        es un dict {id_registro: id_abonado_real}.
+        Retorna (registros, ground_truth, abonados_reales).
 
         tipo:
           'A' — bajo ruido, identidades claras
           'B' — alto ruido, muchos nombres similares
           'C' — escalabilidad, muchos registros
+          'D' — personalizado: usa los parámetros adicionales (todos
+                obligatorios si tipo='D').
+
+        Parámetros opcionales (solo para tipo='D'):
+          n_abonados             : int, número de abonados reales
+          registros_por_abonado  : (min, max) registros por abonado
+          nivel_ruido            : float en [0, 1]
+          fraude_ratio           : float en [0, 1]
         """
         configs = {
             'A': dict(n_abonados=5,  registros_por_abonado=(2, 3),
@@ -226,7 +268,24 @@ class GeneradorSintetico:
             'C': dict(n_abonados=20, registros_por_abonado=(3, 6),
                       nivel_ruido=0.35, fraude_ratio=0.10),
         }
-        cfg = configs.get(tipo.upper(), configs['A'])
+        tipo_upper = tipo.upper()
+        if tipo_upper == 'D':
+            faltantes = [k for k, v in {
+                'n_abonados': n_abonados,
+                'registros_por_abonado': registros_por_abonado,
+                'nivel_ruido': nivel_ruido,
+                'fraude_ratio': fraude_ratio,
+            }.items() if v is None]
+            if faltantes:
+                raise ValueError(
+                    f"Para tipo='D' debes pasar: {faltantes}"
+                )
+            cfg = dict(n_abonados=n_abonados,
+                       registros_por_abonado=registros_por_abonado,
+                       nivel_ruido=nivel_ruido,
+                       fraude_ratio=fraude_ratio)
+        else:
+            cfg = configs.get(tipo_upper, configs['A'])
         return self._generar(**cfg)
 
     def _generar(self, n_abonados: int, registros_por_abonado: tuple,
@@ -235,7 +294,6 @@ class GeneradorSintetico:
         nombres_disponibles = self.rng.sample(_NOMBRES_BASE,
                                               min(n_abonados, len(_NOMBRES_BASE)))
         if n_abonados > len(_NOMBRES_BASE):
-            # Rellenar con variantes si hacen falta
             extra = [f"Usuario_{i}" for i in range(n_abonados - len(_NOMBRES_BASE))]
             nombres_disponibles += extra
 
@@ -258,7 +316,6 @@ class GeneradorSintetico:
 
         for ab in abonados_reales:
             n_regs = rng.randint(*registros_por_abonado)
-            # Si es fraudulento, genera más registros (sybil attack)
             if ab['fraudulento']:
                 n_regs = rng.randint(n_regs, n_regs + 3)
             for _ in range(n_regs):
