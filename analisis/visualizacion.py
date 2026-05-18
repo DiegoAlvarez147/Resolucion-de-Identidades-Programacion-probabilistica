@@ -484,9 +484,9 @@ def main():
     print("\nPaso 1: Corriendo los 3 escenarios...")
 
     datos_abc = {}
-    for esc, n_iter, burn in [('A', 2000, 400),
-                               ('B', 3000, 600),
-                               ('C', 4000, 800)]:
+    for esc, n_iter, burn in [('A', 2500, 500),
+                               ('B', 15000, 5000),
+                               ('C', 15000, 5000)]:
         datos_abc[esc] = correr_escenario(esc, n_iter, burn)
         datos_abc[esc]['tipo'] = esc
 
