@@ -76,21 +76,16 @@ class PropuestaMCMC:
 
     def _mover_birth(self, mundo: ModeloOUPM) -> tuple:
         """
-        Birth: crea un abonado nuevo y migra un registro a él.
-
-        Q(birth → W') = p_birth * (1/n_reg)
-          elegimos r_base uniformemente entre todos los registros
-
-        Q(death → W) = p_death_en_W' * (1/n_vacios_en_W')
-          en W' el abonado nuevo es el único vacío posible si r_base
-          se mueve a él, pero puede haber otros vacíos. Para el ratio
-          de Hastings usamos la probabilidad del movimiento inverso exacto:
-          death en W' que elimina al abonado recién creado.
-          n_vacios_en_W' = len(vacios_en_W') después del birth.
+        Propone la creación de un nuevo objeto latente (abonado) en el mundo posible W.
+        Para garantizar el balance detallado con el movimiento de muerte (death), 
+        el nuevo abonado se inicializa sin registros asignados. La asignación de 
+        registros a este nuevo abonado se delegará a movimientos posteriores de reasignación.
         """
         mundo_nuevo = mundo.clonar()
         r_base = self.rng.choice(mundo_nuevo.registros)
 
+        # Se instancia el nuevo abonado utilizando los atributos de un registro base
+        # como heurística inicial, pero el registro no se vincula a este abonado en este paso.
         ab_nuevo = mundo_nuevo._nuevo_abonado(
             nombre_real=r_base.nombre_obs,
             telefono_real=r_base.telefono_obs,
@@ -98,27 +93,27 @@ class PropuestaMCMC:
             ciudad_real=r_base.ciudad_obs,
         )
         mundo_nuevo.abonados.append(ab_nuevo)
-        mundo_nuevo.source[r_base.id] = ab_nuevo
 
-        # Q forward: p_birth * 1/n_reg
+        # Cálculo de la probabilidad de transición directa (Q forward): 
+        # Probabilidad de seleccionar el movimiento 'birth' y elegir el registro r_base.
         p_birth = 0.25
         n_reg   = len(mundo.registros)
         log_q_fwd = math.log(p_birth) - math.log(n_reg)
 
-        # Q backward: probabilidad de proponer death en W' que elimine ab_nuevo.
-        # ab_nuevo tiene r_base asignado → NO es vacío en W'.
-        # Para que death sea posible, necesitamos vacios en W'.
-        # vacios_en_W' = vacios_en_W (birth no libera ni ocupa otros abonados)
+        # Cálculo de la probabilidad de transición inversa (Q backward):
+        # Probabilidad de proponer un 'death' en el nuevo mundo W' que elimine este abonado.
         vacios_en_W_prima = self._abonados_vacios(mundo_nuevo)
         n_vacios_W_prima  = len(vacios_en_W_prima)
+        
         if n_vacios_W_prima == 0:
-            # No hay camino de retorno por death → penalizar fuertemente
+            # Caso de seguridad: si no hay vacíos en W', la reversibilidad se rompe.
             log_q_bwd = -math.inf
         else:
             p_death = 0.15
             log_q_bwd = math.log(p_death) - math.log(n_vacios_W_prima)
 
-        return mundo_nuevo, log_q_fwd, log_q_bwd, 'birth', [r_base]
+        # Se retorna una lista vacía de registros afectados ya que la variable Source(r) no muta.
+        return mundo_nuevo, log_q_fwd, log_q_bwd, 'birth', []
 
     def _mover_death(self, mundo: ModeloOUPM, vacios: list) -> tuple:
         """
